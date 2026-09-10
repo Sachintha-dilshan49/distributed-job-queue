@@ -76,4 +76,17 @@ public class JobRepository {
 
         return jdbc.update(sql);
     }
+
+    public int heartbeat(Long id, String workerId) {
+        String sql = """
+            UPDATE jobs
+            SET lease_expires_at = now() + interval '30 seconds',
+                updated_at = now()
+            WHERE id = ?
+              AND state = 'RUNNING'
+              AND claimed_by = ?
+            """;
+
+        return jdbc.update(sql, id, workerId);
+    }
 }

@@ -40,7 +40,29 @@ public class Worker {
             return;
         }
 
-       int updated = repository.markSucceeded(job.id(), workerId);
+        System.out.println(
+            "Started job: id=" + job.id() +
+            ", type=" + job.type() +
+            ", working 40s"
+        );
+
+        for (int i = 0; i < 4; i++) {
+            try {
+                Thread.sleep(10000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+
+            int renewed = repository.heartbeat(job.id(), workerId);
+
+            if (renewed == 0) {
+                System.out.println("LEASE LOST: job " + job.id());
+                return;
+            }
+        }
+
+        int updated = repository.markSucceeded(job.id(), workerId);
 
         if (updated == 0) {
             System.out.println(
