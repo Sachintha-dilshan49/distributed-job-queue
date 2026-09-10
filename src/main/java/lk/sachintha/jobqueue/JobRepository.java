@@ -44,13 +44,14 @@ public class JobRepository {
         return results.isEmpty() ? null : results.get(0);
     }
 
-    public void markSucceeded(Long id) {
+    public int markSucceeded(Long id) {
     String sql = """
         UPDATE jobs
         SET state = 'SUCCEEDED', updated_at = now()
-        WHERE id = ?
+        WHERE id = ? AND state = 'PENDING'
         """;
 
     jdbc.update(sql, id);
+    return jdbc.update(sql, id);
 }
 }
