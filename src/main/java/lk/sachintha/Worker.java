@@ -12,11 +12,11 @@ public class Worker {
         this.repository = repository;
     }
 
-    @Scheduled(fixedDelay = 1000)
+    @Scheduled(fixedDelay = 10)
     public void poll() {
 
       
-        Job job = repository.findOnePending();
+        Job job = repository.claim();
 
         if (job == null) {
             return;

@@ -24,12 +24,18 @@ public class JobRepository {
         return jdbc.queryForObject(sql, Long.class, type, payload);
     }
 
-    public Job findOnePending() {
+        public Job claim() {
         String sql = """
-            SELECT * FROM jobs
-            WHERE state = 'PENDING'
-            ORDER BY created_at
-            LIMIT 1
+            UPDATE jobs
+            SET state = 'RUNNING', updated_at = now()
+            WHERE id = (
+                SELECT id FROM jobs
+                WHERE state = 'PENDING'
+                ORDER BY created_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            )
+            RETURNING *
             """;
 
         List<Job> results = jdbc.query(sql, (rs, rowNum) -> new Job(
@@ -45,13 +51,12 @@ public class JobRepository {
     }
 
     public int markSucceeded(Long id) {
-    String sql = """
-        UPDATE jobs
-        SET state = 'SUCCEEDED', updated_at = now()
-        WHERE id = ? AND state = 'PENDING'
-        """;
+        String sql = """
+            UPDATE jobs
+            SET state = 'SUCCEEDED', updated_at = now()
+            WHERE id = ? AND state = 'RUNNING'
+            """;
 
-    jdbc.update(sql, id);
-    return jdbc.update(sql, id);
-}
+        return jdbc.update(sql, id);
+    }
 }
