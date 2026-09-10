@@ -2,6 +2,8 @@ package lk.sachintha.jobqueue;
 
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
+import java.time.OffsetDateTime;
+import java.util.List;
 
 @Repository
 public class JobRepository {
@@ -13,12 +15,42 @@ public class JobRepository {
     }
 
     public Long insert(String type, String payload) {
+        String sql = """
+            INSERT INTO jobs (type, payload, state)
+            VALUES (?, ?::jsonb, 'PENDING')
+            RETURNING id
+            """;
+
+        return jdbc.queryForObject(sql, Long.class, type, payload);
+    }
+
+    public Job findOnePending() {
+        String sql = """
+            SELECT * FROM jobs
+            WHERE state = 'PENDING'
+            ORDER BY created_at
+            LIMIT 1
+            """;
+
+        List<Job> results = jdbc.query(sql, (rs, rowNum) -> new Job(
+            rs.getLong("id"),
+            rs.getString("type"),
+            rs.getString("payload"),
+            rs.getString("state"),
+            rs.getObject("created_at", OffsetDateTime.class),
+            rs.getObject("updated_at", OffsetDateTime.class)
+        ));
+
+        return results.isEmpty() ? null : results.get(0);
+    }
+
+    public void markSucceeded(Long id) {
     String sql = """
-        INSERT INTO jobs (type, payload, state)
-        VALUES (?, ?::jsonb, 'PENDING')
-        RETURNING id
+        UPDATE jobs
+        SET state = 'SUCCEEDED', updated_at = now()
+        WHERE id = ?
         """;
 
-    return jdbc.queryForObject(sql, Long.class, type, payload);
+    jdbc.update(sql, id);
 }
 }
