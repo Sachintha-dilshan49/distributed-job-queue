@@ -24,10 +24,13 @@ public class JobRepository {
         return jdbc.queryForObject(sql, Long.class, type, payload);
     }
 
-        public Job claim() {
+    public Job claim(String workerId) {
         String sql = """
             UPDATE jobs
-            SET state = 'RUNNING', updated_at = now()
+            SET state = 'RUNNING',
+                updated_at = now(),
+                claimed_by = ?,
+                lease_expires_at = now() + interval '30 seconds'
             WHERE id = (
                 SELECT id FROM jobs
                 WHERE state = 'PENDING'
@@ -45,7 +48,7 @@ public class JobRepository {
             rs.getString("state"),
             rs.getObject("created_at", OffsetDateTime.class),
             rs.getObject("updated_at", OffsetDateTime.class)
-        ));
+        ), workerId);
 
         return results.isEmpty() ? null : results.get(0);
     }

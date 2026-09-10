@@ -1,11 +1,13 @@
 package lk.sachintha.jobqueue;
 
+import org.springframework.context.annotation.Profile;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.net.InetAddress;
 
 @Component
+@Profile("worker")
 public class Worker {
 
     private final JobRepository repository;
@@ -32,7 +34,7 @@ public class Worker {
     @Scheduled(fixedDelay = 10)
     public void poll() {
 
-        Job job = repository.claim();
+        Job job = repository.claim(workerId);
 
         if (job == null) {
             return;
