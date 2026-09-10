@@ -53,13 +53,27 @@ public class JobRepository {
         return results.isEmpty() ? null : results.get(0);
     }
 
-    public int markSucceeded(Long id) {
+    public int markSucceeded(Long id, String workerId) {
         String sql = """
             UPDATE jobs
             SET state = 'SUCCEEDED', updated_at = now()
-            WHERE id = ? AND state = 'RUNNING'
+            WHERE id = ? AND state = 'RUNNING' AND claimed_by = ?
             """;
 
-        return jdbc.update(sql, id);
+        return jdbc.update(sql, id, workerId);
+    }
+
+    public int reapExpiredLeases() {
+        String sql = """
+            UPDATE jobs
+            SET state = 'PENDING',
+                claimed_by = NULL,
+                lease_expires_at = NULL,
+                updated_at = now()
+            WHERE state = 'RUNNING'
+              AND lease_expires_at < now()
+            """;
+
+        return jdbc.update(sql);
     }
 }

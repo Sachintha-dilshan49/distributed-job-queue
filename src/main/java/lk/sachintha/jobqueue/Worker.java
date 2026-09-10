@@ -40,11 +40,11 @@ public class Worker {
             return;
         }
 
-        int updated = repository.markSucceeded(job.id());
+       int updated = repository.markSucceeded(job.id(), workerId);
 
         if (updated == 0) {
             System.out.println(
-                "DUPLICATE: job " + job.id() + " was already taken"
+                "LEASE LOST: job " + job.id() + " now belongs to another worker"
             );
         } else {
             System.out.println(
