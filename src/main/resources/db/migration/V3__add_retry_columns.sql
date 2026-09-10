@@ -1,0 +1,11 @@
+ALTER TABLE jobs
+    ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 5,
+    ADD COLUMN run_after TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ADD COLUMN last_error TEXT;
+
+ALTER TABLE jobs DROP CONSTRAINT jobs_state_check;
+
+ALTER TABLE jobs
+    ADD CONSTRAINT jobs_state_check
+    CHECK (state IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'DEAD'));

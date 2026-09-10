@@ -8,5 +8,7 @@ public record Job(
     String payload,
     String state,
     OffsetDateTime createdAt,
-    OffsetDateTime updatedAt
+    OffsetDateTime updatedAt,
+    int attempts,
+    int maxAttempts
 ) {}

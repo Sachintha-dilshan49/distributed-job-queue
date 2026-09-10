@@ -30,10 +30,11 @@ public class JobRepository {
             SET state = 'RUNNING',
                 updated_at = now(),
                 claimed_by = ?,
-                lease_expires_at = now() + interval '30 seconds'
+                lease_expires_at = now() + interval '30 seconds',
+                attempts = attempts + 1
             WHERE id = (
                 SELECT id FROM jobs
-                WHERE state = 'PENDING'
+                WHERE state = 'PENDING' AND run_after <= now()
                 ORDER BY created_at
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
