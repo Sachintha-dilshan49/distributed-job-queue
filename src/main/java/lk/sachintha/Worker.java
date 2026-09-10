@@ -22,9 +22,13 @@ public class Worker {
             return;
         }
 
-        System.out.println(
-            "Processing job: id=" + job.id() + ", type=" + job.type()
-        );
-        repository.markSucceeded(job.id());
+
+        int updated = repository.markSucceeded(job.id());
+
+if (updated == 0) {
+    System.out.println("DUPLICATE: job " + job.id() + " was already taken");
+} else {
+    System.out.println("Processing job: id=" + job.id() + ", type=" + job.type());
+}
     }
 }
