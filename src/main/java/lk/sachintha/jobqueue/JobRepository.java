@@ -48,7 +48,9 @@ public class JobRepository {
             rs.getString("payload"),
             rs.getString("state"),
             rs.getObject("created_at", OffsetDateTime.class),
-            rs.getObject("updated_at", OffsetDateTime.class)
+            rs.getObject("updated_at", OffsetDateTime.class),
+            rs.getInt("attempts"),
+            rs.getInt("max_attempts")
         ), workerId);
 
         return results.isEmpty() ? null : results.get(0);
@@ -89,5 +91,22 @@ public class JobRepository {
             """;
 
         return jdbc.update(sql, id, workerId);
+    }
+
+    public int scheduleRetry(Long id, String workerId, String error, long delaySeconds) {
+    String sql = """
+        UPDATE jobs
+        SET state = 'PENDING',
+            claimed_by = NULL,
+            lease_expires_at = NULL,
+            last_error = ?,
+            run_after = now() + ? * interval '1 second',
+            updated_at = now()
+        WHERE id = ?
+          AND state = 'RUNNING'
+          AND claimed_by = ?
+        """;
+
+    return jdbc.update(sql, error, delaySeconds, id, workerId);
     }
 }
