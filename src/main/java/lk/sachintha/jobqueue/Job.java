@@ -10,5 +10,6 @@ public record Job(
     OffsetDateTime createdAt,
     OffsetDateTime updatedAt,
     int attempts,
-    int maxAttempts
+    int maxAttempts,
+    String idempotencyKey
 ) {}

@@ -14,14 +14,14 @@ public class JobRepository {
         this.jdbc = jdbc;
     }
 
-    public Long insert(String type, String payload) {
+    public Long insert(String type, String payload, String idempotencyKey) {
         String sql = """
-            INSERT INTO jobs (type, payload, state)
-            VALUES (?, ?::jsonb, 'PENDING')
+            INSERT INTO jobs (type, payload, state, idempotency_key)
+            VALUES (?, ?::jsonb, 'PENDING', ?)
             RETURNING id
             """;
 
-        return jdbc.queryForObject(sql, Long.class, type, payload);
+        return jdbc.queryForObject(sql, Long.class, type, payload, idempotencyKey);
     }
 
     public Job claim(String workerId) {
@@ -50,7 +50,8 @@ public class JobRepository {
             rs.getObject("created_at", OffsetDateTime.class),
             rs.getObject("updated_at", OffsetDateTime.class),
             rs.getInt("attempts"),
-            rs.getInt("max_attempts")
+            rs.getInt("max_attempts"),
+            rs.getString("idempotency_key")
         ), workerId);
 
         return results.isEmpty() ? null : results.get(0);
@@ -69,7 +70,7 @@ public class JobRepository {
     public int reapExpiredLeases() {
         String sql = """
             UPDATE jobs
-                SET state = CASE WHEN attempts >= max_attempts THEN 'DEAD' ELSE 'PENDING' END,
+            SET state = CASE WHEN attempts >= max_attempts THEN 'DEAD' ELSE 'PENDING' END,
                 last_error = 'lease expired (worker died or stalled)',
                 claimed_by = NULL,
                 lease_expires_at = NULL,
@@ -95,23 +96,23 @@ public class JobRepository {
     }
 
     public int scheduleRetry(Long id, String workerId, String error, long delaySeconds) {
-    String sql = """
-        UPDATE jobs
-        SET state = 'PENDING',
-            claimed_by = NULL,
-            lease_expires_at = NULL,
-            last_error = ?,
-            run_after = now() + ? * interval '1 second',
-            updated_at = now()
-        WHERE id = ?
-          AND state = 'RUNNING'
-          AND claimed_by = ?
-        """;
+        String sql = """
+            UPDATE jobs
+            SET state = 'PENDING',
+                claimed_by = NULL,
+                lease_expires_at = NULL,
+                last_error = ?,
+                run_after = now() + ? * interval '1 second',
+                updated_at = now()
+            WHERE id = ?
+              AND state = 'RUNNING'
+              AND claimed_by = ?
+            """;
 
-    return jdbc.update(sql, error, delaySeconds, id, workerId);
+        return jdbc.update(sql, error, delaySeconds, id, workerId);
     }
 
-        public int markDead(Long id, String workerId, String error) {
+    public int markDead(Long id, String workerId, String error) {
         String sql = """
             UPDATE jobs
             SET state = 'DEAD',
@@ -125,5 +126,20 @@ public class JobRepository {
             """;
 
         return jdbc.update(sql, error, id, workerId);
+    }
+
+        public int applyEffectOnce(Long jobId, String idempotencyKey) {
+        String sql = """
+            WITH recorded AS (
+                INSERT INTO completed_effects (idempotency_key)
+                VALUES (?)
+                ON CONFLICT (idempotency_key) DO NOTHING
+                RETURNING idempotency_key
+            )
+            INSERT INTO fake_payments (job_id, idempotency_key)
+            SELECT ?, idempotency_key FROM recorded
+            """;
+
+        return jdbc.update(sql, idempotencyKey, jobId);
     }
 }

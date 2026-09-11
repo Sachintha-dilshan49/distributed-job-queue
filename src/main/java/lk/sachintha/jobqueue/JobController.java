@@ -16,9 +16,13 @@ public class JobController {
 
     @PostMapping
     public ResponseEntity<Map<String, Long>> create(@RequestBody CreateJobRequest request) {
-        Long id = repository.insert(request.type(), request.payload());
-return ResponseEntity.status(201).body(Map.of("id", id));
+        if (request.idempotencyKey() == null || request.idempotencyKey().isBlank()) {
+            return ResponseEntity.badRequest().build();
+        }
+
+        Long id = repository.insert(request.type(), request.payload(), request.idempotencyKey());
+        return ResponseEntity.status(201).body(Map.of("id", id));
     }
 
-    public record CreateJobRequest(String type, String payload) {}
+    public record CreateJobRequest(String type, String payload, String idempotencyKey) {}
 }
