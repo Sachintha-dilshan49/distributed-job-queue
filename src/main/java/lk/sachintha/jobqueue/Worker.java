@@ -72,7 +72,14 @@ public class Worker {
             handleFailure(job, e);
             return;
         }
+                int applied = repository.applyEffectOnce(job.id(), job.idempotencyKey());
 
+        if (applied == 0) {
+            System.out.println(
+                "SKIPPED: effect for key " + job.idempotencyKey() + " was already applied"
+            );
+        }
+        
         int updated = repository.markSucceeded(job.id(), workerId);
 
         if (updated == 0) {
