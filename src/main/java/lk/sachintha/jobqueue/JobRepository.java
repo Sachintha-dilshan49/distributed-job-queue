@@ -69,7 +69,8 @@ public class JobRepository {
     public int reapExpiredLeases() {
         String sql = """
             UPDATE jobs
-            SET state = 'PENDING',
+                SET state = CASE WHEN attempts >= max_attempts THEN 'DEAD' ELSE 'PENDING' END,
+                last_error = 'lease expired (worker died or stalled)',
                 claimed_by = NULL,
                 lease_expires_at = NULL,
                 updated_at = now()
@@ -108,5 +109,21 @@ public class JobRepository {
         """;
 
     return jdbc.update(sql, error, delaySeconds, id, workerId);
+    }
+
+        public int markDead(Long id, String workerId, String error) {
+        String sql = """
+            UPDATE jobs
+            SET state = 'DEAD',
+                claimed_by = NULL,
+                lease_expires_at = NULL,
+                last_error = ?,
+                updated_at = now()
+            WHERE id = ?
+              AND state = 'RUNNING'
+              AND claimed_by = ?
+            """;
+
+        return jdbc.update(sql, error, id, workerId);
     }
 }

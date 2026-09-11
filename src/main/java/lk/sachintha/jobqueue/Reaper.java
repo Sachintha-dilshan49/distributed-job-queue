@@ -19,7 +19,7 @@ public class Reaper {
         int reaped = repository.reapExpiredLeases();
 
         if (reaped > 0) {
-            System.out.println("REAPER: returned " + reaped + " jobs to PENDING");
+            System.out.println("REAPER: reaped " + reaped + " expired leases");
         }
     }
 }
