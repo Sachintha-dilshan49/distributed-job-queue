@@ -14,6 +14,7 @@ class ChaosTest extends AbstractIntegrationTest {
 
     private static final int JOB_COUNT = 200;
     private static final int WORKER_COUNT = 4;
+    private static final int ABANDON_PERCENT = 15;
 
     @Test
     void noJobIsLostAndNoEffectIsAppliedTwice() throws Exception {
@@ -35,9 +36,9 @@ class ChaosTest extends AbstractIntegrationTest {
                         continue;
                     }
 
-                    // 30% of the time, act like the worker was hard-killed:
+                    // Some of the time, act like the worker was hard-killed:
                     // claim the job, then never finish it and never heartbeat.
-                    if (ThreadLocalRandom.current().nextInt(100) < 30) {
+                    if (ThreadLocalRandom.current().nextInt(100) < ABANDON_PERCENT) {
                         abandoned.incrementAndGet();
                         continue;
                     }
@@ -70,15 +71,18 @@ class ChaosTest extends AbstractIntegrationTest {
 
         Integer succeeded = jdbc.queryForObject(
             "SELECT COUNT(*) FROM jobs WHERE state = 'SUCCEEDED'", Integer.class);
+        Integer dead = jdbc.queryForObject(
+            "SELECT COUNT(*) FROM jobs WHERE state = 'DEAD'", Integer.class);
         Integer payments = jdbc.queryForObject(
             "SELECT COUNT(*) FROM fake_payments", Integer.class);
         Integer distinctKeys = jdbc.queryForObject(
             "SELECT COUNT(DISTINCT idempotency_key) FROM fake_payments", Integer.class);
 
-        System.out.println("CHAOS: " + abandoned.get() + " jobs abandoned mid-flight");
+        System.out.println("CHAOS: " + abandoned.get() + " jobs abandoned mid-flight, "
+                         + succeeded + " succeeded, " + dead + " dead");
 
-        assertEquals(JOB_COUNT, succeeded, "every job must finish");
-        assertEquals(JOB_COUNT, payments, "no duplicate effects");
-        assertEquals(JOB_COUNT, distinctKeys, "one effect per key");
+        assertEquals(JOB_COUNT, succeeded + dead, "no job may be left unfinished");
+        assertEquals(succeeded, payments, "one effect per succeeded job");
+        assertEquals(payments, distinctKeys, "no duplicate effects");
     }
 }

@@ -39,3 +39,7 @@ jobs:
 
       - name: Build and test
         run: ./mvnw --batch-mode clean verify
+
+      - name: Show test failures
+        if: failure()
+        run: cat target/surefire-reports/*.txt
