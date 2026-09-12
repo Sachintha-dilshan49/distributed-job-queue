@@ -185,6 +185,17 @@ cannot record the key without also applying the effect. `fake_payments` stands
 in for the real side effect (charging a card, sending an email). A worker that
 finds the key already recorded sees 0 rows affected and logs `SKIPPED`.
 
+The key is load-bearing, not a second line of defence. `applyEffectOnce` runs
+before `markSucceeded` and does not check `claimed_by`, so a worker whose lease
+has already been reaped can still write the effect — the uniqueness of the key
+is the only thing stopping that from becoming a duplicate. Gating the effect on
+`claimed_by` would not close the hole either, because the lease can expire in
+the moment between the check passing and the effect landing; that check would
+narrow the window without removing it. This is the deliberate shape of
+at-least-once delivery rather than a defect: the worker is allowed to be wrong
+about whether it still owns the job, and correctness is carried by the effect
+being safe to attempt more than once.
+
 ## Configuration
 
 All four properties live in
