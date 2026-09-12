@@ -14,7 +14,7 @@ public class Reaper {
         this.repository = repository;
     }
 
-    @Scheduled(fixedDelay = 5000)
+       @Scheduled(fixedDelayString = "${jobqueue.reaper-interval-ms}")
     public void reap() {
         int reaped = repository.reapExpiredLeases();
 

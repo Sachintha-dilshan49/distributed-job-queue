@@ -1,5 +1,6 @@
 package lk.sachintha.jobqueue;
 
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 import java.time.OffsetDateTime;
@@ -9,9 +10,12 @@ import java.util.List;
 public class JobRepository {
 
     private final JdbcTemplate jdbc;
+    private final long leaseSeconds;
 
-    public JobRepository(JdbcTemplate jdbc) {
+    public JobRepository(JdbcTemplate jdbc,
+                         @Value("${jobqueue.lease-seconds}") long leaseSeconds) {
         this.jdbc = jdbc;
+        this.leaseSeconds = leaseSeconds;
     }
 
     public Long insert(String type, String payload, String idempotencyKey) {
@@ -30,7 +34,7 @@ public class JobRepository {
             SET state = 'RUNNING',
                 updated_at = now(),
                 claimed_by = ?,
-                lease_expires_at = now() + interval '30 seconds',
+                lease_expires_at = now() + ? * interval '1 second',
                 attempts = attempts + 1
             WHERE id = (
                 SELECT id FROM jobs
@@ -52,7 +56,7 @@ public class JobRepository {
             rs.getInt("attempts"),
             rs.getInt("max_attempts"),
             rs.getString("idempotency_key")
-        ), workerId);
+        ), workerId, leaseSeconds);
 
         return results.isEmpty() ? null : results.get(0);
     }
@@ -85,14 +89,14 @@ public class JobRepository {
     public int heartbeat(Long id, String workerId) {
         String sql = """
             UPDATE jobs
-            SET lease_expires_at = now() + interval '30 seconds',
+            SET lease_expires_at = now() + ? * interval '1 second',
                 updated_at = now()
             WHERE id = ?
               AND state = 'RUNNING'
               AND claimed_by = ?
             """;
 
-        return jdbc.update(sql, id, workerId);
+        return jdbc.update(sql, leaseSeconds, id, workerId);
     }
 
     public int scheduleRetry(Long id, String workerId, String error, long delaySeconds) {
@@ -128,7 +132,7 @@ public class JobRepository {
         return jdbc.update(sql, error, id, workerId);
     }
 
-        public int applyEffectOnce(Long jobId, String idempotencyKey) {
+    public int applyEffectOnce(Long jobId, String idempotencyKey) {
         String sql = """
             WITH recorded AS (
                 INSERT INTO completed_effects (idempotency_key)

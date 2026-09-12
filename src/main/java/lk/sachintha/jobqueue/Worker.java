@@ -3,6 +3,7 @@ package lk.sachintha.jobqueue;
 import org.springframework.context.annotation.Profile;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import org.springframework.beans.factory.annotation.Value;
 
 import java.net.InetAddress;
 import java.util.concurrent.ThreadLocalRandom;
@@ -11,14 +12,19 @@ import java.util.concurrent.ThreadLocalRandom;
 @Profile("worker")
 public class Worker {
 
-    private static final long BASE_DELAY_SECONDS = 5;
-    private static final long MAX_JITTER_SECONDS = 3;
+       private static final long MAX_JITTER_SECONDS = 3;
 
     private final JobRepository repository;
     private final String workerId;
+    private final long baseDelaySeconds;
+    private final long workDurationMs;
 
-    public Worker(JobRepository repository) {
+    public Worker(JobRepository repository,
+                  @Value("${jobqueue.backoff-base-seconds}") long baseDelaySeconds,
+                  @Value("${jobqueue.work-duration-ms}") long workDurationMs) {
         this.repository = repository;
+        this.baseDelaySeconds = baseDelaySeconds;
+        this.workDurationMs = workDurationMs;
 
         String hostname;
 
@@ -55,16 +61,14 @@ public class Worker {
                 throw new RuntimeException("simulated failure for testing");
             }
 
-            for (int i = 0; i < 4; i++) {
-                Thread.sleep(10000);
+                       Thread.sleep(workDurationMs / 2);
 
-                int renewed = repository.heartbeat(job.id(), workerId);
-
-                if (renewed == 0) {
-                    System.out.println("LEASE LOST: job " + job.id());
-                    return;
-                }
+            if (repository.heartbeat(job.id(), workerId) == 0) {
+                System.out.println("LEASE LOST: job " + job.id());
+                return;
             }
+
+            Thread.sleep(workDurationMs / 2);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return;
@@ -108,7 +112,7 @@ public class Worker {
                 );
             }
         } else {
-            long backoff = BASE_DELAY_SECONDS * (long) Math.pow(2, job.attempts() - 1);
+            long backoff = baseDelaySeconds * (long) Math.pow(2, job.attempts() - 1);
             long jitter = ThreadLocalRandom.current().nextLong(0, MAX_JITTER_SECONDS + 1);
             long delay = backoff + jitter;
 
