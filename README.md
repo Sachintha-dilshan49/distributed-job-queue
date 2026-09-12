@@ -124,11 +124,18 @@ seconds for `RUNNING` rows whose lease has passed and returns them. From outside
 the database a crashed worker and a merely slow worker look identical — both
 just stop reporting, and nothing can tell them apart, so the design has to
 tolerate being wrong about which one it is. The live worker keeps saying it is
-alive by extending its own lease mid-job, and the extension is conditional on
-`claimed_by` still matching, so it fails the moment the job has been taken away.
-Being wrong in the other direction is survivable too: a job reclaimed from a
-worker that was only slow simply runs again, and the idempotency key stops the
-effect happening twice.
+alive by extending its own lease mid-job — with the current fake workload that
+is a single heartbeat at the halfway point, not a repeating timer — and the
+extension is conditional on `claimed_by` still matching, so it fails the moment
+the job has been taken away. Being wrong in the other direction is survivable
+too: a job reclaimed from a worker that was only slow simply runs again, and the
+idempotency key stops the effect happening twice.
+
+Extending the lease has a price, and it is paid on the recovery path: every
+extension moves the deadline the Reaper is waiting for, so the later in a job a
+worker dies, the longer that job sits `RUNNING` before anyone notices. That is
+the trade being made — a slow worker is not robbed of its job, and in exchange a
+dead one is found later.
 
 **Ownership checks on every write.** `markSucceeded`, `heartbeat`,
 `scheduleRetry` and `markDead` all require `state = 'RUNNING' AND claimed_by =
@@ -356,8 +363,8 @@ the automated run.
 |---|---|---|
 | Claim safety | 3 workers, 1000 jobs | ~1900 duplicate claims before `SKIP LOCKED`, 0 after |
 | Kill, no heartbeats | 20s job, worker hard-killed mid-job | A second worker finished it; created to finished 54.5s (30s lease + reaper + 20s of work) |
-| Heartbeats, no kill | 40s job, 30s lease, no kill | Finished in 40.2s, never reclaimed; `lease_expires_at` observed moving forward during the run |
-| Kill with heartbeats | 40s job, killed ~15s in | Recovered by another worker; created to finished 82.5s. Killing later means slower recovery, because each heartbeat has pushed the lease further out |
+| Heartbeats, no kill | 40s job, 30s lease, no kill | Finished in 40.2s, never reclaimed; `lease_expires_at` observed moving forward when the halfway heartbeat fired |
+| Kill with heartbeats | 40s job, 30s lease, hard-killed ~23s in — after the single heartbeat at ~20s | Recovered by a different worker, `attempts = 2`; created to finished 92.2s. The heartbeat at 20s had pushed the lease from 30s out to ~50s, so the Reaper could not reclaim the job until 50s; recovery then took a further 40s for the full re-run. Killing later means slower recovery, which is the cost of tolerating slow-but-alive workers |
 | Retry and dead letter | job type `fail` | Observed delays 7s, 11s, 22s, 42s, then `DEAD` on attempt 5 with `last_error` preserved |
 | Poison job | `RUNNING` row, expired lease, `attempts = 5` | Reaper set it `DEAD` with `last_error` = `lease expired (worker died or stalled)`. The same row with `attempts = 2` went back to `PENDING` |
 | Idempotency | Two jobs sharing one key, two workers | Both reached `SUCCEEDED`, exactly 1 row in `fake_payments`, the second worker logged `SKIPPED` |
