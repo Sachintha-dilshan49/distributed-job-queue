@@ -20,4 +20,5 @@ public abstract class AbstractIntegrationTest {
         jdbc.update("DELETE FROM completed_effects");
         jdbc.update("DELETE FROM jobs");
     }
+
 }
