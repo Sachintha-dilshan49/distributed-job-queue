@@ -6,7 +6,15 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.net.InetAddress;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 @Component
 @Profile("worker")
@@ -16,18 +24,30 @@ public class Worker {
 
     private final JobRepository repository;
     private final JobMetrics metrics;
+    private final Map<String, JobHandler> handlers;
     private final String workerId;
     private final long baseDelaySeconds;
-    private final long workDurationMs;
+    private final long leaseSeconds;
+
+    private final ScheduledExecutorService heartbeatExecutor =
+        Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "heartbeat");
+            t.setDaemon(true);
+            return t;
+        });
 
     public Worker(JobRepository repository,
                   JobMetrics metrics,
+                  List<JobHandler> handlerList,
                   @Value("${jobqueue.backoff-base-seconds}") long baseDelaySeconds,
-                  @Value("${jobqueue.work-duration-ms}") long workDurationMs) {
+                  @Value("${jobqueue.lease-seconds}") long leaseSeconds) {
         this.repository = repository;
         this.metrics = metrics;
         this.baseDelaySeconds = baseDelaySeconds;
-        this.workDurationMs = workDurationMs;
+        this.leaseSeconds = leaseSeconds;
+
+        this.handlers = handlerList.stream()
+            .collect(Collectors.toMap(JobHandler::type, Function.identity()));
 
         String hostname;
 
@@ -41,7 +61,8 @@ public class Worker {
 
         this.workerId = hostname + "-" + pid;
 
-        System.out.println("Worker ID: " + this.workerId);
+        System.out.println("Worker ID: " + this.workerId
+            + ", handlers: " + handlers.keySet());
     }
 
     @Scheduled(fixedDelay = 10)
@@ -61,35 +82,25 @@ public class Worker {
             ", attempt " + job.attempts() + "/" + job.maxAttempts()
         );
 
+        ScheduledFuture<?> heartbeat = startHeartbeat(job);
+
         try {
-            if (job.type().equals("fail")) {
-                throw new RuntimeException("simulated failure for testing");
+            JobHandler handler = handlers.get(job.type());
+
+            if (handler == null) {
+                throw new IllegalStateException(
+                    "no handler registered for type: " + job.type());
             }
 
-            Thread.sleep(workDurationMs / 2);
-
-            if (repository.heartbeat(job.id(), workerId) == 0) {
-                metrics.leaseLost();
-                System.out.println("LEASE LOST: job " + job.id());
-                return;
-            }
-
-            Thread.sleep(workDurationMs / 2);
+            handler.handle(job);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return;
-        } catch (RuntimeException e) {
+        } catch (Exception e) {
             handleFailure(job, e);
             return;
-        }
-
-        int applied = repository.applyEffectOnce(job.id(), job.idempotencyKey());
-
-        if (applied == 0) {
-            metrics.effectSkipped();
-            System.out.println(
-                "SKIPPED: effect for key " + job.idempotencyKey() + " was already applied"
-            );
+        } finally {
+            heartbeat.cancel(false);
         }
 
         int updated = repository.markSucceeded(job.id(), workerId);
@@ -108,7 +119,19 @@ public class Worker {
         }
     }
 
-    private void handleFailure(Job job, RuntimeException e) {
+    private ScheduledFuture<?> startHeartbeat(Job job) {
+        long intervalMs = Math.max(1000, leaseSeconds * 1000 / 3);
+
+        return heartbeatExecutor.scheduleAtFixedRate(() -> {
+            if (repository.heartbeat(job.id(), workerId) == 0) {
+                metrics.leaseLost();
+                System.out.println("LEASE LOST: job " + job.id()
+                    + " while still working on it");
+            }
+        }, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
+    }
+
+    private void handleFailure(Job job, Exception e) {
         String error = e.getMessage();
         int updated;
 
