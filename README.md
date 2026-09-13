@@ -9,7 +9,7 @@ and another worker picks the job back up. The delivery guarantee is
 at-least-once, so side effects are made idempotent with a key supplied by the
 caller.
 
-**Status:** phases 1-5, 7 and 9 of 12 complete.
+**Status:** phases 1-5, 7, 9 and 10 of 12 complete.
 
 ## Why build this
 
@@ -24,6 +24,7 @@ the handler.
 
 - Spring Boot 4.1.1, Java 25, Maven (`mvnw` wrapper, Maven 3.9.16)
 - Spring JDBC with `JdbcTemplate` — no JPA, the SQL is the point
+- Spring Boot Actuator and Micrometer with a Prometheus registry for metrics
 - Flyway for migrations
 - PostgreSQL 16, published on host port **5433**
 - Docker and Docker Compose
@@ -55,6 +56,7 @@ not also kill the recovery mechanism.
  |  JobController           |     |  claim poll every 10ms      |
  |  Reaper every 5s         |     |  one heartbeat mid-job      |
  |  Flyway migrations       |     |  no web server, no Flyway   |
+ |  /actuator/prometheus    |     |  no metrics endpoint        |
  +------------+-------------+     +--------------+--------------+
               |                                  |
               |        both go straight to       |
@@ -203,9 +205,92 @@ at-least-once delivery rather than a defect: the worker is allowed to be wrong
 about whether it still owns the job, and correctness is carried by the effect
 being safe to attempt more than once.
 
+## Metrics
+
+Phase 10 adds `spring-boot-starter-actuator` and `micrometer-registry-prometheus`,
+and one component —
+[JobMetrics](src/main/java/lk/sachintha/jobqueue/JobMetrics.java) — that holds
+every metric definition in one place. `Worker` and `Reaper` take it as a
+constructor dependency, and each counter is incremented on the same branch that
+prints the log line for the same event, so the logs and the counters cannot
+drift apart.
+
+`management.endpoints.web.exposure.include=health,info,metrics,prometheus` is set
+in both [src/main/resources/application.properties](src/main/resources/application.properties)
+and [src/test/resources/application.properties](src/test/resources/application.properties),
+which exposes three endpoints on the API:
+
+- `GET /actuator/health`
+- `GET /actuator/metrics`
+- `GET /actuator/prometheus`
+
+### Counters
+
+Monotonic and per process: each one starts at zero when the process starts and
+only ever goes up.
+
+| Counter | Incremented when | What it tells you |
+|---|---|---|
+| `jobqueue.jobs.claimed` | a worker's `claim` returns a job | How much work that worker has picked up |
+| `jobqueue.jobs.succeeded` | `markSucceeded` updated a row | Completed work — throughput |
+| `jobqueue.jobs.retried` | `scheduleRetry` updated a row | How often attempts fail and get rescheduled |
+| `jobqueue.jobs.dead` | `markDead` updated a row | Jobs that used up `max_attempts` and need a human |
+| `jobqueue.leases.reaped` | the Reaper reclaims expired leases | Workers dying or stalling. Incremented by the number of rows reclaimed, not by one per sweep |
+| `jobqueue.effects.skipped` | `applyEffectOnce` affected 0 rows because the key was already recorded | Idempotency doing its job — a job ran twice and the effect did not |
+| `jobqueue.leases.lost` | a heartbeat or a terminal update affected 0 rows because `claimed_by` no longer matched | Workers being reclaimed while still alive — a lease too short for the workload |
+
+### Gauges
+
+Current state, read from the database on every scrape through
+`JobRepository.countByState`, which is a `SELECT COUNT(*) FROM jobs WHERE state = ?`.
+
+| Gauge | Reads | What it tells you |
+|---|---|---|
+| `jobqueue.jobs.pending` | rows in `PENDING` | Queue depth — work waiting to be claimed |
+| `jobqueue.jobs.running` | rows in `RUNNING` | Work in flight, held under a lease |
+| `jobqueue.jobs.dead.current` | rows in `DEAD` | The dead-letter backlog as it stands now |
+
+`jobqueue.jobs.dead` and `jobqueue.jobs.dead.current` are two different things:
+the first counts transitions into `DEAD` made by this process, the second counts
+rows sitting in `DEAD` right now.
+
+### Counters versus gauges
+
+A counter answers "how many jobs were claimed since this process started". A
+gauge answers "how many jobs are waiting right now". Only the gauge shows a
+backlog building. A claim counter climbing steadily tells you work is being
+picked up, but not whether it is being picked up as fast as it arrives. If
+`jobqueue.jobs.pending` keeps rising, jobs are arriving faster than the workers
+drain them — and that, queue depth rather than any rate, is the signal for "is
+the queue falling behind". Worker count and lease length are what you change in
+response to it.
+
+The counters are what explain why: `jobqueue.jobs.retried` and
+`jobqueue.leases.reaped` climbing alongside a growing `pending` gauge says the
+backlog is made of work being redone, not of new work arriving.
+
+### Names on the scrape page
+
+The Prometheus registry rewrites meter names — dots become underscores, and
+counters gain a `_total` suffix. So `/actuator/prometheus` shows
+`jobqueue_jobs_succeeded_total`, `jobqueue_leases_reaped_total`, and
+`jobqueue_jobs_pending` with no suffix because it is a gauge.
+`/actuator/metrics` uses the original dotted names.
+
+### What a scrape actually showed
+
+Starting the API alone with one `PENDING` job in the table,
+`jobqueue_jobs_pending` read `1.0`. Running a worker until the job completed
+dropped it to `0.0` — while `jobqueue_jobs_claimed_total` and
+`jobqueue_jobs_succeeded_total` on the API's page both stayed at `0.0`. That is
+the split worth understanding: the counters live in whichever process did the
+work, and the worker is a separate process with no endpoint of its own, so the
+API never sees its counts. The gauges read shared database state, so any process
+can report them.
+
 ## Configuration
 
-All four properties live in
+All four `jobqueue.*` properties live in
 [application.properties](src/main/resources/application.properties) and can be
 overridden on the command line or through the environment.
 
@@ -220,7 +305,9 @@ Not configurable: the worker's 10 ms claim poll interval, the 0-3 second jitter
 range, and `max_attempts`, which is a column default of 5 on the `jobs` table.
 
 Database settings come from the usual Spring properties, so `SPRING_DATASOURCE_URL`
-is what Compose overrides.
+is what Compose overrides. The same file also sets
+`management.endpoints.web.exposure.include=health,info,metrics,prometheus`, which
+is what makes the Actuator endpoints visible — see [Metrics](#metrics).
 
 ## Running it
 
@@ -243,7 +330,16 @@ Compose runs the copy baked into the image, not your working tree.
 
 ```powershell
 docker compose logs -f worker
-docker compose down
+docker compose stop
+```
+
+`docker compose down` removes the containers, and the Compose Postgres has no
+named volume, so the database goes with them — including the `jobqueue_test`
+database that local tests use. `docker compose stop` pauses the stack and keeps
+the data. If the database has already gone, recreate it:
+
+```powershell
+docker exec -it jobqueue-postgres-1 psql -U jobqueue -d jobqueue -c "CREATE DATABASE jobqueue_test"
 ```
 
 ### Manually
@@ -388,7 +484,7 @@ The heartbeat test is the one worth reading twice: without heartbeats, a healthy
 | Testcontainers could not reach Docker on Windows | Docker Desktop returned an empty 400 on the named pipe | Tests use a local `jobqueue_test` database instead; CI uses a Postgres service container |
 | CI failed with exit code 126 | `mvnw` was not executable in Git — Windows does not set the bit | `git update-index --chmod=+x mvnw` |
 | The chaos test was flaky in CI (198/200 succeeded) | At 30% abandonment some jobs reached `max_attempts` and went `DEAD`, which is correct behaviour rather than a failure | Lowered abandonment to 15% and assert `succeeded + dead = total` instead |
-| Tested stale code several times | Windows locks the jar while it is running, and Docker runs the copy baked into the image | Stop every `java` process and check the jar's timestamp; rebuild the image after any code change |
+| Tested stale code repeatedly | Windows locks the jar while it is running, Docker bakes a copy of it into the image, and Maven skips recompiling when the classes look current | Stop all `java` processes, check the jar's timestamp, rebuild the image, and run `mvnw clean` after a dependency change |
 
 ## Known limitations
 
@@ -397,14 +493,30 @@ The heartbeat test is the one worth reading twice: without heartbeats, a healthy
 - `payload` has to be sent as a JSON string rather than a nested JSON object.
 - The workload is fake: two sleeps with a heartbeat between them, and a
   `fake_payments` insert standing in for a real side effect.
-- No metrics and no dashboard. Queue depth, claim rate and failure rate can only
-  be seen by querying the table.
 - `pom.xml` still targets Java 21 as its release level while the project runs on
   25.
 - The API is write-only: `POST /jobs` and nothing else. There is no endpoint for
   reading a job's state back.
 - Nothing is authenticated or rate limited, and the Compose database has no
   volume, so its data goes when the container does.
+- Counters are per process, and workers run with
+  `spring.main.web-application-type=none`, so they expose no metrics endpoint at
+  all. Only the API's counters can be scraped, and those cover the API's own work
+  — the Reaper — not the workers'. A production setup would give workers a
+  management port and let Prometheus scrape every instance and sum them.
+- Prometheus and Grafana are not part of `docker-compose.yml`. The app exposes a
+  scrape endpoint and nothing collects or graphs it, so there is still no
+  dashboard.
+- The three gauges each run their own `COUNT(*)` on `jobs`, so one scrape is
+  three queries. Fine at this scale; a large table would need a cached or
+  approximate count instead.
+- The `worker` service uses `depends_on` on the API with
+  `condition: service_started`, which waits for the API container to start but
+  not for Flyway to finish migrating. The proper fix is an Actuator health check
+  on the API with `condition: service_healthy` — possible now that Actuator is
+  present, but not done yet.
+- Nothing tests the metrics. The endpoints and the increments were checked by
+  hand, not by an automated test.
 
 ## Roadmap
 
@@ -412,6 +524,5 @@ The phases not yet started:
 
 - **Phase 6** — a real workload instead of sleeps
 - **Phase 8** — a dashboard with a chaos panel for killing workers from the browser
-- **Phase 10** — Prometheus and Grafana for queue depth, claim rate and failure rate
 - **Phase 11** — deploy it somewhere
 - **Phase 12** (optional) — a Kafka-backed variant, to compare a log against a table
