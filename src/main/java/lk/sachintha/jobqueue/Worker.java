@@ -1,9 +1,9 @@
 package lk.sachintha.jobqueue;
 
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Profile;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
-import org.springframework.beans.factory.annotation.Value;
 
 import java.net.InetAddress;
 import java.util.concurrent.ThreadLocalRandom;
@@ -12,17 +12,20 @@ import java.util.concurrent.ThreadLocalRandom;
 @Profile("worker")
 public class Worker {
 
-       private static final long MAX_JITTER_SECONDS = 3;
+    private static final long MAX_JITTER_SECONDS = 3;
 
     private final JobRepository repository;
+    private final JobMetrics metrics;
     private final String workerId;
     private final long baseDelaySeconds;
     private final long workDurationMs;
 
     public Worker(JobRepository repository,
+                  JobMetrics metrics,
                   @Value("${jobqueue.backoff-base-seconds}") long baseDelaySeconds,
                   @Value("${jobqueue.work-duration-ms}") long workDurationMs) {
         this.repository = repository;
+        this.metrics = metrics;
         this.baseDelaySeconds = baseDelaySeconds;
         this.workDurationMs = workDurationMs;
 
@@ -50,6 +53,8 @@ public class Worker {
             return;
         }
 
+        metrics.jobClaimed();
+
         System.out.println(
             "Started job: id=" + job.id() +
             ", type=" + job.type() +
@@ -61,9 +66,10 @@ public class Worker {
                 throw new RuntimeException("simulated failure for testing");
             }
 
-                       Thread.sleep(workDurationMs / 2);
+            Thread.sleep(workDurationMs / 2);
 
             if (repository.heartbeat(job.id(), workerId) == 0) {
+                metrics.leaseLost();
                 System.out.println("LEASE LOST: job " + job.id());
                 return;
             }
@@ -76,21 +82,25 @@ public class Worker {
             handleFailure(job, e);
             return;
         }
-                int applied = repository.applyEffectOnce(job.id(), job.idempotencyKey());
+
+        int applied = repository.applyEffectOnce(job.id(), job.idempotencyKey());
 
         if (applied == 0) {
+            metrics.effectSkipped();
             System.out.println(
                 "SKIPPED: effect for key " + job.idempotencyKey() + " was already applied"
             );
         }
-        
+
         int updated = repository.markSucceeded(job.id(), workerId);
 
         if (updated == 0) {
+            metrics.leaseLost();
             System.out.println(
                 "LEASE LOST: job " + job.id() + " now belongs to another worker"
             );
         } else {
+            metrics.jobSucceeded();
             System.out.println(
                 "Processing job: id=" + job.id() +
                 ", type=" + job.type()
@@ -106,6 +116,7 @@ public class Worker {
             updated = repository.markDead(job.id(), workerId, error);
 
             if (updated > 0) {
+                metrics.jobDead();
                 System.out.println(
                     "DEAD: job " + job.id() +
                     " after " + job.attempts() + " attempts: " + error
@@ -119,6 +130,7 @@ public class Worker {
             updated = repository.scheduleRetry(job.id(), workerId, error, delay);
 
             if (updated > 0) {
+                metrics.jobRetried();
                 System.out.println(
                     "RETRY: job " + job.id() +
                     " attempt " + job.attempts() + "/" + job.maxAttempts() +
@@ -128,6 +140,7 @@ public class Worker {
         }
 
         if (updated == 0) {
+            metrics.leaseLost();
             System.out.println(
                 "LEASE LOST: job " + job.id() + " failed but now belongs to another worker"
             );

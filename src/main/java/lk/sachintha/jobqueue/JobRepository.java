@@ -146,4 +146,9 @@ public class JobRepository {
 
         return jdbc.update(sql, idempotencyKey, jobId);
     }
+
+        public int countByState(String state) {
+        String sql = "SELECT COUNT(*) FROM jobs WHERE state = ?";
+        return jdbc.queryForObject(sql, Integer.class, state);
+    }
 }
