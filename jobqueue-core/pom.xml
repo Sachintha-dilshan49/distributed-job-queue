@@ -42,4 +42,11 @@
         </dependency>
     </dependencies>
 
+    <distributionManagement>
+    <repository>
+        <id>github</id>
+        <url>https://maven.pkg.github.com/Sachintha-dilshan49/distributed-job-queue</url>
+    </repository>
+</distributionManagement>
+
 </project>
