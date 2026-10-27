@@ -1,138 +1,184 @@
 # Distributed Job Queue
 
-A job queue built from scratch on Java, Spring Boot and PostgreSQL. It tracks
-work, not messages: every job has a state, an attempt count, a lease held by
-whichever worker is running it, a retry schedule, and a recorded failure reason.
-Job logic lives in handlers the queue dispatches to by job type, so the same
-machinery runs any kind of work. Several worker processes claim jobs from the
-same table concurrently without ever claiming the same job twice. When a worker dies mid-job its lease expires
-and another worker picks the job back up. The delivery guarantee is
-at-least-once, so side effects are made idempotent with a key supplied by the
-caller.
+[![CI](https://github.com/Sachintha-dilshan49/distributed-job-queue/actions/workflows/ci.yml/badge.svg)](https://github.com/Sachintha-dilshan49/distributed-job-queue/actions/workflows/ci.yml)
+![Java](https://img.shields.io/badge/Java-25-orange)
+![Spring Boot](https://img.shields.io/badge/Spring%20Boot-4.1-6DB33F)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791)
 
-**Status:** phases 1-5, 7, 9 and 10 of 12 complete.
+A background job queue built from scratch with Java, Spring Boot and PostgreSQL.
 
-## Why build this
+You submit a job (for example "split this document into chunks"). Several worker processes pick jobs up and run them in parallel. If a job fails, it is retried later. If a worker crashes halfway through a job, another worker takes the job over. If a job keeps failing, it is parked in a dead-letter state instead of retrying forever.
 
-In production you would use Celery, Sidekiq, SQS with a worker pool, or Temporal.
-This is a learning and portfolio project, built to understand what those systems
-do underneath: how a job is claimed safely under concurrency, how a dead worker
-is told apart from a slow one, what backoff and dead-lettering actually look
-like as rows in a table, and why at-least-once delivery pushes correctness onto
-the handler.
+The core is packaged as a **reusable Spring Boot library** (`jobqueue-core`): add the dependency, write one class for your job type, and the queue handles everything else.
 
-## Stack
+> **Why build this?** In production you would use Celery, Sidekiq, SQS or Temporal. I built this to understand what those systems do underneath: how to hand out jobs safely when many workers ask at once, how to tell a crashed worker from a slow one, and how to make sure a retried job does not repeat its side effects.
 
-- Spring Boot 4.1.1, Java 25, Maven (`mvnw` wrapper, Maven 3.9.16)
-- Spring JDBC with `JdbcTemplate` — no JPA, the SQL is the point
-- Spring Boot Actuator and Micrometer with a Prometheus registry for metrics
-- Flyway for migrations
-- PostgreSQL 16, published on host port **5433**
-- Docker and Docker Compose
-- GitHub Actions, JUnit 5
+<!-- Add a screenshot or GIF of the dashboard here: ![Dashboard](docs/dashboard.png) -->
 
-`pom.xml` still sets `<java.version>21</java.version>` while the project is built
-and run on JDK 25.
+---
+
+## Highlights
+
+| | |
+|---|---|
+| **Safe concurrent claiming** | Many workers poll the same table; no job is ever claimed twice (`FOR UPDATE SKIP LOCKED`). |
+| **Crash recovery** | Each claimed job has a lease. If the worker dies, the lease expires and the job goes back to the queue. |
+| **Long jobs are safe** | A heartbeat keeps renewing the lease while the job runs, so a slow-but-alive worker is not robbed of its job. |
+| **Retries with backoff** | Failed jobs retry after 5s, 10s, 20s, 40s… plus random jitter. |
+| **Dead-letter state** | After 5 failed attempts a job moves to `DEAD`, with the error message saved. |
+| **No duplicate side effects** | Every job carries an idempotency key, so a job that runs twice still applies its effect once. |
+| **Observability** | Prometheus metrics, plus a Next.js dashboard showing jobs and workers live. |
+| **Tested under failure** | Integration and chaos tests against real PostgreSQL, run on every push by GitHub Actions. |
+
+## Results
+
+Measured locally against PostgreSQL 16.
+
+| Test | Setup | Result |
+|---|---|---|
+| Claim safety | 3 workers, 1,000 jobs | **~1,900 duplicate claims** with a naive read-then-update → **0** with `SKIP LOCKED` |
+| Worker crash | 3 worker containers, one killed with `docker kill` mid-job | Another worker finished the job (`attempts = 2`, different `claimed_by`) |
+| Long job | 40s job with a 30s lease, no crash | Finished on the first attempt; heartbeats kept the lease alive |
+| Chaos | 200 jobs, 4 workers, 15% of jobs abandoned mid-run | Every job finished (`SUCCEEDED` or `DEAD`), **no job lost, no effect applied twice**, ~4s |
+
+---
 
 ## Architecture
 
-There is no coordinator process and no claim endpoint. Workers talk to
-PostgreSQL directly, and PostgreSQL is the only thing coordinating them. One jar
-is built and run under two Spring profiles:
+There is no central coordinator. Workers talk to PostgreSQL directly, and the database is the only thing coordinating them. The same jar runs in two modes (Spring profiles):
 
-- **default profile** — the web API (`POST /jobs`) plus the Reaper
-- **`worker` profile** — the polling worker only, with the web server disabled
-  (`spring.main.web-application-type=none`) and Flyway off
-
-`Worker` does not know how to do any job. It claims a row, looks the job's `type`
-up in a map of `JobHandler` beans that Spring injected as a `List`, and calls
-`handle(job)` — see [Writing a handler](#writing-a-handler). Everything around
-that call is the queue's business: the lease, the heartbeat timer, retries,
-backoff and dead-lettering.
-
-The Reaper is annotated `@Profile("!worker")`, so it runs only in the API. That
-keeps it to a single copy, and means killing a worker during a failure test does
-not also kill the recovery mechanism.
+- **API** (default profile): accepts jobs over HTTP, runs the **Reaper** that recovers expired leases, runs database migrations, exposes metrics.
+- **Worker** (`worker` profile): only polls for jobs and runs them. No web server.
 
 ```
-  POST /jobs
-      |
-      v
- +--------------------------+     +-----------------------------+
- |  API  (default profile)  |     |  Worker (worker profile) xN |
- |  JobController           |     |  claim poll every 10ms      |
- |  Reaper every 5s         |     |  JobHandler beans           |
- |  Flyway migrations       |     |  heartbeat timer while busy |
- |  /actuator/prometheus    |     |  dispatch by type to handler|
- |  runs no job handlers    |     |  no web server, no Flyway   |
- +------------+-------------+     +--------------+--------------+
-              |                                  |
-              |        both go straight to       |
-              +---------------+------------------+
-                              |
-                              v
-                  +-----------------------+
-                  |  PostgreSQL 16        |
-                  |    jobs               |
-                  |    completed_effects  |
-                  |    fake_payments      |
-                  +-----------------------+
+  POST /jobs                                Dashboard (Next.js)
+      |                                            |
+      v                                            v
+ +---------------------------+      +-----------------------------+
+ |  API  (default profile)   |      |  Worker  (worker profile) xN |
+ |  - JobController          |      |  - claims a job every 10 ms  |
+ |  - AdminController        |      |  - runs the matching handler |
+ |  - Reaper (every 5 s)     |      |  - heartbeat while running   |
+ |  - Flyway migrations      |      |  - retry / dead-letter       |
+ |  - /actuator/prometheus   |      |                              |
+ +-------------+-------------+      +--------------+---------------+
+               |                                   |
+               +----------------+------------------+
+                                |
+                                v
+                     +----------------------+
+                     |    PostgreSQL 16     |
+                     |  jobs                |
+                     |  completed_effects   |
+                     +----------------------+
 ```
+
+### Project structure
+
+```
+distributed-job-queue/
+├── jobqueue-core/     The reusable library: Worker, Reaper, JobRepository,
+│                      JobHandler interface, metrics, Flyway migrations,
+│                      Spring Boot auto-configuration
+├── jobqueue-demo/     Example app using the library: REST API, admin API,
+│                      example handlers, and all the tests
+├── dashboard/         Next.js dashboard (job counts, workers, crash button)
+├── docker-compose.yml PostgreSQL + 1 API + 3 workers
+└── .github/workflows/ CI: builds and tests on every push
+```
+
+---
 
 ## Job lifecycle
 
+A job is always in exactly one of four states.
+
 ```
-                      POST /jobs
-                          |
-                          v
-                     +---------+
-      +------------> | PENDING | <------------------+
-      |              +---------+                    |
-      |                   |                         |  scheduleRetry:
-      |    claim: UPDATE ... WHERE id = (           |  attempts < max_attempts,
-      |      SELECT ... FOR UPDATE SKIP LOCKED)     |  run_after = now() + backoff
-      |    state = RUNNING, attempts += 1,          |
-      |    claimed_by = <worker>,                   |
-      |    lease_expires_at = now() + lease         |
-      |                   |                         |
-      |                   v                         |
-      |              +---------+ ----- failure -----+
-      |              | RUNNING |
-      |              +---------+ ---- failure, attempts >= max_attempts ---+
-      |               |      |                                             |
-      |               |      | reaper: lease_expires_at < now()            |
-      |               |      |   attempts <  max_attempts --> PENDING      |
-      +---------------+      |   attempts >= max_attempts --> DEAD --------+
-       (lease expired)       |                                             |
-                             | handler ran (its effect                     v
-                             | applied once), then                      +------+
-                             | markSucceeded                            | DEAD |
-                             v                                          +------+
-                       +-----------+
-                       | SUCCEEDED |
-                       +-----------+
+            POST /jobs
+                |
+                v
+           +---------+  <-------- failed, attempts left
+           | PENDING |            (wait: backoff + jitter)
+           +---------+  <-------- lease expired, attempts left
+                |                 (Reaper)
+                | claimed by a worker
+                v
+           +---------+ ---- failed, no attempts left ----> +------+
+           | RUNNING |                                     | DEAD |
+           +---------+ ---- lease expired, no attempts --> +------+
+                |
+                | handler finished
+                v
+          +-----------+
+          | SUCCEEDED |
+          +-----------+
 ```
 
-`jobs.state` is constrained to exactly these four values. There is no `FAILED`
-state: a failed attempt goes back to `PENDING` with a future `run_after`, or
-straight to `DEAD` when the attempts are used up.
+There is no `FAILED` state: a failed attempt either goes back to `PENDING` with a later `run_after` time, or to `DEAD` when all attempts are used.
 
-## Writing a handler
+---
 
-A job type is handled by a Spring bean implementing `JobHandler`:
+## Key design decisions
 
-```java
-public interface JobHandler {
+**1. Claiming a job in one SQL statement.**
+A worker claims a job with:
 
-    String type();
-
-    void handle(Job job) throws Exception;
-}
+```sql
+UPDATE jobs SET state = 'RUNNING', attempts = attempts + 1, claimed_by = ?, lease_expires_at = ...
+WHERE id = (SELECT id FROM jobs
+            WHERE state = 'PENDING' AND run_after <= now()
+            ORDER BY created_at
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1)
+RETURNING *;
 ```
 
-`Worker` takes a `List<JobHandler>` in its constructor and collects it into a
-type-to-handler map. Adding a job type means writing one `@Component` and
-nothing else — no registration call, no change to `Worker`:
+`SKIP LOCKED` makes each worker skip rows another worker has already locked instead of waiting for them. So N workers polling at the same moment get N different jobs. Doing it in two steps (read a job, then update it) fails under concurrency: that version produced ~1,900 duplicate claims in the 1,000-job test.
+
+**2. Leases and heartbeats.**
+From outside, a crashed worker and a very slow worker look the same: both go quiet. So every claim comes with a lease (default 30s). While the handler runs, a background timer renews the lease every 10s (a third of the lease). If the worker dies, renewals stop, the lease expires, and the Reaper returns the job to `PENDING`.
+The trade-off: renewals push the deadline forward, so a worker that dies late in a job is noticed later. In exchange, a slow worker is never robbed of a job it is still doing.
+
+**3. Every write checks ownership.**
+Marking a job succeeded, renewing its lease, retrying it or killing it all require `state = 'RUNNING' AND claimed_by = <this worker>`. A worker that stalled and lost its lease cannot come back and overwrite the job now owned by someone else; its update simply affects 0 rows and it logs `LEASE LOST`.
+
+**4. At-least-once delivery + idempotency keys.**
+Because a job can be reclaimed from a slow worker, it can run more than once. Every job therefore carries an `idempotencyKey`. The handler records its side effect and the key **in one SQL statement**, using `INSERT ... ON CONFLICT DO NOTHING` on `completed_effects`. If the key is already there, the effect is skipped. Doing both in one statement means a crash can never leave the key recorded without the effect, or the other way round.
+
+**5. Attempts are counted when a job is claimed, not when it fails.**
+A job that crashes its worker never gets to report a failure. Counting at claim time means even these "poison" jobs eventually reach `DEAD` instead of crashing workers forever.
+
+**6. Failures are visible, not silent.**
+A job whose type has no handler is treated as a normal failure: it retries and ends in `DEAD` with the message `no handler registered for type: X` saved in `last_error`.
+
+---
+
+## Using the library
+
+### 1. Add the dependency
+
+`jobqueue-core` is published to GitHub Packages:
+
+```xml
+<repositories>
+  <repository>
+    <id>github</id>
+    <url>https://maven.pkg.github.com/Sachintha-dilshan49/distributed-job-queue</url>
+  </repository>
+</repositories>
+
+<dependency>
+  <groupId>lk.sachintha</groupId>
+  <artifactId>jobqueue-core</artifactId>
+  <version>1.0.0-SNAPSHOT</version>
+</dependency>
+```
+
+GitHub Packages requires a personal access token with `read:packages` in your Maven `settings.xml`.
+
+The library registers itself through Spring Boot auto-configuration and runs its own Flyway migrations. Your application needs a PostgreSQL datasource and `@EnableScheduling`.
+
+### 2. Write a handler
 
 ```java
 @Component
@@ -151,503 +197,162 @@ public class EmailJobHandler implements JobHandler {
 
     @Override
     public void handle(Job job) throws Exception {
-        // do the work, and record the effect under the job's idempotency key
+        // do the work...
         repository.applyEffectOnce(job.id(), job.idempotencyKey());
     }
 }
 ```
 
-The queue supplies claiming, leases, heartbeats, retries with backoff, dead
-lettering, and the unique-key machinery behind `applyEffectOnce`. The handler
-supplies `handle()`.
+That is all. No registration and no changes to the queue. To signal failure, throw an exception: the queue handles retries, backoff and dead-lettering.
 
-Two handlers ship as examples:
+### Example handlers in the demo app
 
-| Handler | `type()` | What it does |
+| Handler | `type` | What it does |
 |---|---|---|
-| [SlowJobHandler](src/main/java/lk/sachintha/jobqueue/SlowJobHandler.java) | `test` | Sleeps `jobqueue.work-duration-ms`, then calls `applyEffectOnce` |
-| [FailingJobHandler](src/main/java/lk/sachintha/jobqueue/FailingJobHandler.java) | `fail` | Throws immediately, to exercise retry and dead-lettering |
+| `DocumentChunkingJobHandler` | `chunk` | Splits a document into 100-word chunks and stores them (a real workload) |
+| `SlowJobHandler` | `test` | Sleeps for a set time, to test leases and heartbeats |
+| `FailingJobHandler` | `fail` | Always throws, to test retries and dead-lettering |
 
-**Failure is a thrown exception.** `handle` is declared `throws Exception`, and
-whatever comes out of it is caught by `Worker`, which runs the existing path:
-`scheduleRetry` with backoff while attempts remain, `markDead` after that, with
-the exception's message stored in `last_error`. A handler never deals with
-retries, attempt counts or backoff itself.
-
-**An unknown type is a failure, not a silent drop.** If no handler claims the
-job's type, `Worker` throws `IllegalStateException("no handler registered for
-type: X")`. That goes down the same failure path, so the job retries and then
-lands in `DEAD` with that sentence as its `last_error` — visible in the table
-rather than lost. A job of type `unknown-type` was observed retrying at 8s, 12s,
-21s and 42s and going `DEAD` on attempt 5 with exactly that message.
-
-**A handler can take as long as it needs.** `Worker` starts a background daemon
-timer before calling `handle` and cancels it in a `finally` block. The timer
-renews the lease every `lease-seconds / 3` (with a 1 second floor) for as long as
-the handler runs, so the Reaper does not reclaim a job that is still being
-worked. A 40-second handler under a 30-second lease was observed finishing on
-attempt 1, never reclaimed.
-
-**Idempotency belongs to the handler.** Only the handler knows what its side
-effect is, so it is the handler that records the key next to that effect —
-`applyEffectOnce` stays in `JobRepository` as the helper for doing both in one
-statement. See [At-least-once plus idempotency](#key-design-decisions) for why
-that statement is shaped the way it is.
-
-**Two beans returning the same `type()` will not start.** The map is built with
-`Collectors.toMap`, which throws on a duplicate key, so the worker fails at
-startup rather than silently picking one.
-
-**An interrupted handler is left to the Reaper.** `Worker` catches
-`InterruptedException` separately, restores the interrupt flag and returns
-without touching the row, so the job stays `RUNNING` until its lease expires and
-the Reaper puts it back.
-
-How many workers run is a deployment choice, not something a handler knows
-about: `deploy.replicas` on the `worker` service in Compose, or more processes
-started with `--spring.profiles.active=worker`. A handler sees one job at a time
-and nothing about its neighbours.
-
-## Key design decisions
-
-**Claiming with `FOR UPDATE SKIP LOCKED`.** A worker claims a job in one
-statement — an `UPDATE ... WHERE id = (SELECT id ... FOR UPDATE SKIP LOCKED
-LIMIT 1) RETURNING *`. The subquery locks a single eligible row, and any
-concurrent transaction skips over locked rows instead of blocking on them, so N
-workers polling at the same moment get N different jobs. Read-then-update in two
-steps does not survive concurrency: measured with 3 workers over 1000 jobs, the
-two-step version produced about 1900 duplicate claims and the single-statement
-version produced 0.
-
-**Leases and heartbeats.** A claim stamps `claimed_by` (hostname + PID) and
-`lease_expires_at = now() + jobqueue.lease-seconds`. The Reaper scans every 5
-seconds for `RUNNING` rows whose lease has passed and returns them. From outside
-the database a crashed worker and a merely slow worker look identical — both
-just stop reporting, and nothing can tell them apart, so the design has to
-tolerate being wrong about which one it is. The live worker keeps saying it is
-alive by extending its own lease while the handler runs: a background daemon
-timer, started before `handle` and cancelled in a `finally` block, fires every
-`lease-seconds / 3` (floored at 1 second). The extension is conditional on
-`claimed_by` still matching, so it fails the moment the job has been taken away,
-and the worker logs `LEASE LOST` from the timer thread while still working. Being wrong in the other direction is survivable
-too: a job reclaimed from a worker that was only slow simply runs again, and the
-idempotency key stops the effect happening twice.
-
-Extending the lease has a price, and it is paid on the recovery path: every
-extension moves the deadline the Reaper is waiting for, so the later in a job a
-worker dies, the longer that job sits `RUNNING` before anyone notices. That is
-the trade being made — a slow worker is not robbed of its job, and in exchange a
-dead one is found later.
-
-**Ownership checks on every write.** `markSucceeded`, `heartbeat`,
-`scheduleRetry` and `markDead` all require `state = 'RUNNING' AND claimed_by =
-?`. A worker that stalled long enough to lose its lease cannot come back and
-mark a job done that someone else is now running; the update affects 0 rows and
-the worker logs `LEASE LOST`.
-
-**Backoff with jitter.** `attempts` is incremented at claim time, not at failure
-time, so a job that kills its worker outright is still counted. On failure the
-delay is `jobqueue.backoff-base-seconds * 2^(attempts-1)` plus a random 0-3
-seconds of jitter, written into `run_after`; the claim query only considers rows
-with `run_after <= now()`. Backoff stops a failing dependency from being
-hammered. Jitter is not optional decoration: without it, a batch of jobs that
-failed together at the same instant retries in lockstep forever, so the
-dependency that just fell over gets the whole batch again at exactly the same
-moment, and the retries themselves become the load.
-
-**Dead letters and poison jobs.** `max_attempts` defaults to 5. A job that fails
-its last attempt goes to `DEAD` with `last_error` kept for inspection. The
-Reaper applies the same rule with `CASE WHEN attempts >= max_attempts THEN
-'DEAD' ELSE 'PENDING' END`, which covers the nastier case: a poison job that
-crashes its worker outright never gets the chance to report its own failure, so
-without that clause the Reaper would resurrect it forever and it would keep
-killing workers.
-
-**At-least-once plus idempotency.** Recovery means a job can run twice. That is
-inherent, not a bug to fix: the worker and the database are separate processes,
-so between "the work happened" and "the database knows the work happened" there
-is a gap, and a crash in that gap is always possible. Recording the key first
-just swaps the failure for one where the key is recorded and the work never
-happened. Exactly-once across that boundary is not achievable; what is
-achievable is at-least-once execution with effects that do not care how many
-times they run.
-
-So `idempotencyKey` is required on `POST /jobs` (a missing or blank key gets a
-400), and the effect is applied through a single statement that both records the
-key and does the work:
-
-```sql
-WITH recorded AS (
-    INSERT INTO completed_effects (idempotency_key)
-    VALUES (?)
-    ON CONFLICT (idempotency_key) DO NOTHING
-    RETURNING idempotency_key
-)
-INSERT INTO fake_payments (job_id, idempotency_key)
-SELECT ?, idempotency_key FROM recorded
-```
-
-`completed_effects.idempotency_key` is the primary key, so the first writer wins
-the `ON CONFLICT` race and the CTE returns no rows to anyone else — the effect
-row is inserted exactly once. Because both halves are one statement, a crash
-cannot record the key without also applying the effect. `fake_payments` stands
-in for the real side effect (charging a card, sending an email).
-
-`applyEffectOnce` is called by the handler, not by `Worker`, because only the
-handler knows what its effect is. It returns the number of rows inserted, so a
-handler that wants to know whether it was the one that did the work can check for
-0. `SlowJobHandler` ignores the return value.
-
-The key is load-bearing, not a second line of defence. `applyEffectOnce` runs
-inside the handler, before `Worker` calls `markSucceeded`, and does not check
-`claimed_by`, so a worker whose lease has already been reaped can still write the
-effect — the uniqueness of the key
-is the only thing stopping that from becoming a duplicate. Gating the effect on
-`claimed_by` would not close the hole either, because the lease can expire in
-the moment between the check passing and the effect landing; that check would
-narrow the window without removing it. This is the deliberate shape of
-at-least-once delivery rather than a defect: the worker is allowed to be wrong
-about whether it still owns the job, and correctness is carried by the effect
-being safe to attempt more than once.
-
-## Metrics
-
-Phase 10 adds `spring-boot-starter-actuator` and `micrometer-registry-prometheus`,
-and one component —
-[JobMetrics](src/main/java/lk/sachintha/jobqueue/JobMetrics.java) — that holds
-every metric definition in one place. `Worker` and `Reaper` take it as a
-constructor dependency, and each counter is incremented on the same branch that
-prints the log line for the same event, so the logs and the counters cannot
-drift apart.
-
-`management.endpoints.web.exposure.include=health,info,metrics,prometheus` is set
-in both [src/main/resources/application.properties](src/main/resources/application.properties)
-and [src/test/resources/application.properties](src/test/resources/application.properties),
-which exposes three endpoints on the API:
-
-- `GET /actuator/health`
-- `GET /actuator/metrics`
-- `GET /actuator/prometheus`
-
-### Counters
-
-Monotonic and per process: each one starts at zero when the process starts and
-only ever goes up.
-
-| Counter | Incremented when | What it tells you |
-|---|---|---|
-| `jobqueue.jobs.claimed` | a worker's `claim` returns a job | How much work that worker has picked up |
-| `jobqueue.jobs.succeeded` | `markSucceeded` updated a row | Completed work — throughput |
-| `jobqueue.jobs.retried` | `scheduleRetry` updated a row | How often attempts fail and get rescheduled |
-| `jobqueue.jobs.dead` | `markDead` updated a row | Jobs that used up `max_attempts` and need a human |
-| `jobqueue.leases.reaped` | the Reaper reclaims expired leases | Workers dying or stalling. Incremented by the number of rows reclaimed, not by one per sweep |
-| `jobqueue.effects.skipped` | nothing, currently | Registered, but no code path increments it any more: the effect moved into the handlers, and neither shipped handler checks what `applyEffectOnce` returned. It reads 0 |
-| `jobqueue.leases.lost` | a heartbeat timer tick or a terminal update affected 0 rows because `claimed_by` no longer matched | Workers being reclaimed while still alive — a lease too short, or a worker stalled past its heartbeat |
-
-### Gauges
-
-Current state, read from the database on every scrape through
-`JobRepository.countByState`, which is a `SELECT COUNT(*) FROM jobs WHERE state = ?`.
-
-| Gauge | Reads | What it tells you |
-|---|---|---|
-| `jobqueue.jobs.pending` | rows in `PENDING` | Queue depth — work waiting to be claimed |
-| `jobqueue.jobs.running` | rows in `RUNNING` | Work in flight, held under a lease |
-| `jobqueue.jobs.dead.current` | rows in `DEAD` | The dead-letter backlog as it stands now |
-
-`jobqueue.jobs.dead` and `jobqueue.jobs.dead.current` are two different things:
-the first counts transitions into `DEAD` made by this process, the second counts
-rows sitting in `DEAD` right now.
-
-### Counters versus gauges
-
-A counter answers "how many jobs were claimed since this process started". A
-gauge answers "how many jobs are waiting right now". Only the gauge shows a
-backlog building. A claim counter climbing steadily tells you work is being
-picked up, but not whether it is being picked up as fast as it arrives. If
-`jobqueue.jobs.pending` keeps rising, jobs are arriving faster than the workers
-drain them — and that, queue depth rather than any rate, is the signal for "is
-the queue falling behind". Worker count and lease length are what you change in
-response to it.
-
-The counters are what explain why: `jobqueue.jobs.retried` and
-`jobqueue.leases.reaped` climbing alongside a growing `pending` gauge says the
-backlog is made of work being redone, not of new work arriving.
-
-### Names on the scrape page
-
-The Prometheus registry rewrites meter names — dots become underscores, and
-counters gain a `_total` suffix. So `/actuator/prometheus` shows
-`jobqueue_jobs_succeeded_total`, `jobqueue_leases_reaped_total`, and
-`jobqueue_jobs_pending` with no suffix because it is a gauge.
-`/actuator/metrics` uses the original dotted names.
-
-### What a scrape actually showed
-
-Starting the API alone with one `PENDING` job in the table,
-`jobqueue_jobs_pending` read `1.0`. Running a worker until the job completed
-dropped it to `0.0` — while `jobqueue_jobs_claimed_total` and
-`jobqueue_jobs_succeeded_total` on the API's page both stayed at `0.0`. That is
-the split worth understanding: the counters live in whichever process did the
-work, and the worker is a separate process with no endpoint of its own, so the
-API never sees its counts. The gauges read shared database state, so any process
-can report them.
-
-## Configuration
-
-All four `jobqueue.*` properties live in
-[application.properties](src/main/resources/application.properties) and can be
-overridden on the command line or through the environment.
-
-| Property | Default | What it affects |
-|---|---|---|
-| `jobqueue.lease-seconds` | `30` | How long a claim is valid. Used when a job is claimed, when the heartbeat timer renews it, and as the basis for the heartbeat interval (`lease-seconds / 3`, floored at 1 second). Shorter means faster recovery from a dead worker and more risk of reclaiming a slow one |
-| `jobqueue.work-duration-ms` | `40000` | How long `SlowJobHandler` sleeps, in one stretch. It affects that one handler, not the queue |
-| `jobqueue.backoff-base-seconds` | `5` | The base of `base * 2^(attempts-1)` for the retry delay, before jitter |
-| `jobqueue.reaper-interval-ms` | `5000` | The `fixedDelay` between Reaper sweeps for expired leases |
-
-Not configurable: the worker's 10 ms claim poll interval, the heartbeat interval
-(derived from `lease-seconds`), the 0-3 second jitter range, and `max_attempts`,
-which is a column default of 5 on the `jobs` table.
-
-Database settings come from the usual Spring properties, so `SPRING_DATASOURCE_URL`
-is what Compose overrides. The same file also sets
-`management.endpoints.web.exposure.include=health,info,metrics,prometheus`, which
-is what makes the Actuator endpoints visible — see [Metrics](#metrics).
+---
 
 ## Running it
 
-### With Docker Compose
+**Requirements:** Java 25, Docker, Node.js 20+ (only for the dashboard).
 
-Compose refers to the image by name (`image: jobqueue`) and does not build it,
-and the Dockerfile copies an already-built jar, so the jar and the image have to
-exist first:
+```bash
+# 1. Build the jar (tests need the test database, see below)
+./mvnw clean package -DskipTests
 
-```powershell
-.\mvnw clean package -DskipTests
+# 2. Build the image and start PostgreSQL + API + 3 workers
 docker build -t jobqueue .
 docker compose up -d
 ```
 
-That brings up PostgreSQL 16 (with a healthcheck, published on host port 5433),
-the API on port 8080, and 3 worker replicas. The API and the workers wait for
-the database to report healthy. Rebuild the image after any code change —
-Compose runs the copy baked into the image, not your working tree.
+The API is at `http://localhost:8080`. PostgreSQL is published on host port **5433**.
 
-```powershell
-docker compose logs -f worker
-docker compose stop
+### Submit a job
+
+```bash
+curl -X POST http://localhost:8080/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+        "type": "chunk",
+        "payload": "{\"documentId\": \"doc-1\", \"text\": \"some long text ...\"}",
+        "idempotencyKey": "doc-1-v1"
+      }'
 ```
 
-`docker compose down` removes the containers, and the Compose Postgres has no
-named volume, so the database goes with them — including the `jobqueue_test`
-database that local tests use. `docker compose stop` pauses the stack and keeps
-the data. If the database has already gone, recreate it:
+Returns `201 Created` with the new job's `id`. `idempotencyKey` is required.
 
-```powershell
-docker exec -it jobqueue-postgres-1 psql -U jobqueue -d jobqueue -c "CREATE DATABASE jobqueue_test"
+### Watch a crash recovery
+
+```bash
+docker compose up -d                       # 3 workers running
+# submit a few "test" jobs, then while they run:
+docker kill distributed-job-queue-worker-2 # container name may differ: see `docker ps`
+docker compose logs -f worker              # another worker picks the job up
 ```
 
-### Manually
+### Dashboard
 
-Start just the database:
-
-```powershell
-docker compose up -d postgres
+```bash
+cd dashboard
+npm install
+npm run dev     # http://localhost:3000
 ```
 
-Build the jar:
+Shows job counts by state and which workers are running jobs, refreshed every 3 seconds. The **Kill** button expires a worker's leases, so you can watch the Reaper hand its jobs to other workers without stopping any container.
 
-```powershell
-.\mvnw clean package -DskipTests
-```
+---
 
-Run the API — default profile, web API on port 8080, plus the Reaper. Flyway
-runs the migrations here:
+## API
 
-```powershell
-java -jar target\jobqueue-0.0.1-SNAPSHOT.jar
-```
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/jobs` | Submit a job (`type`, `payload`, `idempotencyKey`) |
+| `GET` | `/admin/stats` | Number of jobs in each state |
+| `GET` | `/admin/workers` | Workers currently running jobs |
+| `POST` | `/admin/workers/{claimedBy}/kill` | Expire a worker's leases (simulated crash) |
+| `GET` | `/actuator/prometheus` | Metrics for Prometheus |
 
-Run a worker in another terminal, and repeat for as many workers as you want:
+## Metrics
 
-```powershell
-java -jar target\jobqueue-0.0.1-SNAPSHOT.jar --spring.profiles.active=worker
-```
+| Metric | Type | Meaning |
+|---|---|---|
+| `jobqueue.jobs.pending` | gauge | Jobs waiting. If this keeps rising, workers can't keep up. |
+| `jobqueue.jobs.running` | gauge | Jobs currently being worked on |
+| `jobqueue.jobs.dead.current` | gauge | Jobs in the dead-letter state |
+| `jobqueue.jobs.claimed` / `succeeded` / `retried` / `dead` | counter | Work done since startup |
+| `jobqueue.leases.reaped` | counter | Jobs recovered from expired leases |
+| `jobqueue.leases.lost` | counter | Times a worker found its job had been taken over |
 
-Flyway is disabled in the worker profile, so start the API at least once against
-a fresh database before running workers on their own.
+Prometheus renames these with underscores and a `_total` suffix for counters, e.g. `jobqueue_jobs_succeeded_total`.
 
-### Submitting a job
+## Configuration
 
-```powershell
-$body = @{
-    type           = "test"
-    payload        = '{"to":"alice","amount":100}'
-    idempotencyKey = "pay-001"
-} | ConvertTo-Json
+| Property | Default | Meaning |
+|---|---|---|
+| `jobqueue.lease-seconds` | `30` | How long a claim lasts without a heartbeat |
+| `jobqueue.backoff-base-seconds` | `5` | First retry delay; doubles each attempt |
+| `jobqueue.reaper-interval-ms` | `5000` | How often the Reaper looks for expired leases |
+| `max_attempts` (per job) | `5` | Attempts before a job goes to `DEAD` |
 
-Invoke-RestMethod -Uri http://localhost:8080/jobs -Method Post -ContentType "application/json" -Body $body
-```
-
-`payload` is sent as a **JSON string**, not a nested JSON object — it is bound
-straight into a `jsonb` column as text. `type` selects the handler: `"test"` for
-the normal path and `"fail"` to exercise retries and dead-lettering. `POST /jobs`
-does not validate the type — a type with no handler is accepted, then fails on
-every attempt and ends up `DEAD` with `last_error` saying which type had no
-handler. The response is `201` with `{"id": <n>}`. A missing or blank
-`idempotencyKey` gets a `400` with no body.
-
-## The recovery demo, in Docker
-
-With `docker compose up -d` running the API and 3 workers:
-
-1. Submit a job with the request above.
-2. Find which worker claimed it:
-
-   ```powershell
-   docker compose logs worker | Select-String "Started job"
-   ```
-
-   The line carries the job id, and `docker compose logs` prefixes each line
-   with the container that produced it (`jobqueue-worker-1`, `-2`, `-3`).
-3. While the job is still running — `SlowJobHandler` sleeps 40 seconds by
-   default — kill
-   that container outright, with no chance to clean up:
-
-   ```powershell
-   docker kill jobqueue-worker-2
-   ```
-
-   The container exits with code 137.
-4. Watch the API log. Within roughly the lease length it prints
-   `REAPER: reaped 1 expired leases` and the job goes back to `PENDING`.
-5. One of the surviving workers claims it and finishes it. The row ends up with
-   `attempts = 2` and a different `claimed_by` from the first run.
-
-Each worker prints `Worker ID: <hostname>-<pid>` at startup. Inside a container
-the PID is always 1, so it is the container hostname that keeps the id unique.
+---
 
 ## Testing
 
-```powershell
-.\mvnw test
+```bash
+# one-time: create the test database
+docker compose exec postgres psql -U jobqueue -d jobqueue -c "CREATE DATABASE jobqueue_test"
+
+./mvnw test
 ```
 
-9 JUnit 5 tests: a context-load smoke test, 7 integration tests over
-`JobRepository` covering claim exclusivity, `run_after`, ownership checks on
-completion and heartbeat, the Reaper's two outcomes and per-key idempotency, and
-one chaos test.
+**9 JUnit 5 tests** against a real PostgreSQL database (no in-memory substitute, because the whole design depends on PostgreSQL's locking):
 
-These are integration tests against a real PostgreSQL — there is no in-memory
-substitute, because the whole design is SQL. They use a separate `jobqueue_test`
-database so a test run cannot wipe development data; each test clears
-`fake_payments`, `completed_effects` and `jobs` before it runs, and Flyway
-creates the schema. Create the database once:
+- 7 integration tests: two workers never claim the same job; jobs waiting for retry are skipped; only the owning worker can complete a job; the Reaper recovers expired leases; the Reaper dead-letters jobs out of attempts; only the owner can renew a lease; an effect is applied once per key
+- 1 chaos test: 200 jobs, 4 concurrent workers, 15% of claims abandoned mid-flight, checking that nothing is lost or duplicated
+- 1 application startup test
 
-```powershell
-docker compose exec postgres psql -U jobqueue -d jobqueue -c "CREATE DATABASE jobqueue_test OWNER jobqueue"
-```
+GitHub Actions runs the full suite on every push and pull request, using a PostgreSQL 16 service container.
 
-The connection defaults to `jdbc:postgresql://localhost:5433/jobqueue_test` and
-is overridden by `TEST_DB_URL`, `TEST_DB_USER` and `TEST_DB_PASSWORD` — see
-[src/test/resources/application.properties](src/test/resources/application.properties).
+---
 
-CI runs the same tests on every push and pull request.
-[.github/workflows/ci.yml](.github/workflows/ci.yml) starts a `postgres:16`
-service container holding `jobqueue_test`, points those three environment
-variables at it, and runs `./mvnw --batch-mode clean verify` on Temurin 25. On
-failure it prints the surefire reports.
+## Problems I ran into
 
-## Test results
-
-Timings were measured by hand against a local PostgreSQL and run from
-`created_at` to the `updated_at` of the final state. The chaos figures come from
-the automated run. The two rows about a single halfway heartbeat were measured
-before heartbeats moved to a background timer; they are kept because they are
-what motivated the change.
-
-| Test | Setup | Result |
+| Problem | Cause | Fix |
 |---|---|---|
-| Claim safety | 3 workers, 1000 jobs | ~1900 duplicate claims before `SKIP LOCKED`, 0 after |
-| Kill, no heartbeats | 20s job, worker hard-killed mid-job | A second worker finished it; created to finished 54.5s (30s lease + reaper + 20s of work) |
-| Heartbeats, no kill (old inline heartbeat) | 40s job, 30s lease, no kill | Finished in 40.2s, never reclaimed; `lease_expires_at` observed moving forward when the halfway heartbeat fired |
-| Kill with heartbeats (old inline heartbeat) | 40s job, 30s lease, hard-killed ~23s in — after the single heartbeat at ~20s | Recovered by a different worker, `attempts = 2`; created to finished 92.2s. The heartbeat at 20s had pushed the lease from 30s out to ~50s, so the Reaper could not reclaim the job until 50s; recovery then took a further 40s for the full re-run. Killing later means slower recovery, which is the cost of tolerating slow-but-alive workers |
-| Heartbeat timer | 40s handler, 30s lease, no kill | Finished on attempt 1, never reclaimed. The timer renews every 10s for as long as `handle` runs, so handler duration and lease length are now independent |
-| Retry and dead letter | job type `fail` | Observed delays 7s, 11s, 22s, 42s, then `DEAD` on attempt 5 with `last_error` preserved |
-| Unknown job type | one job of type `unknown-type` | Retried at 8s, 12s, 21s and 42s, then `DEAD` on attempt 5 with `last_error` = `no handler registered for type: unknown-type` |
-| Poison job | `RUNNING` row, expired lease, `attempts = 5` | Reaper set it `DEAD` with `last_error` = `lease expired (worker died or stalled)`. The same row with `attempts = 2` went back to `PENDING` |
-| Idempotency | Two jobs sharing one key, two workers | Both reached `SUCCEEDED`, exactly 1 row in `fake_payments`, the second worker logged `SKIPPED` |
-| Docker recovery | 3 worker containers, one `docker kill`ed mid-job | The killed container exited 137, another worker finished the job, `attempts = 2`, different `claimed_by` |
-| Chaos | 200 jobs, 4 concurrent workers, 15% of claims abandoned mid-flight (no completion, no heartbeat) | Every job reached a final state, payments equalled succeeded jobs, no key paid twice. Runs in about 4 seconds |
-
-The heartbeat test is the one worth reading twice: without heartbeats, a healthy
-40-second job would have been reclaimed at the 30-second mark.
-
-## Problems hit and how they were solved
-
-| Problem | Cause | Resolution |
-|---|---|---|
-| The web API was also processing jobs | `Worker` had no `@Profile`, so it ran under every profile | `@Profile("worker")` on `Worker` |
-| A worker that had lost its lease could still mark the job done | Completion only checked `state = 'RUNNING'` | Also check `claimed_by = ?`, on every state-changing update |
-| Healthy but slow jobs were reclaimed at the lease deadline | A fixed lease with no renewal | Heartbeat mid-job, conditional on still owning the job |
-| Poison jobs that crash the worker would retry forever | The Reaper always reset an expired lease to `PENDING` | `CASE WHEN attempts >= max_attempts THEN 'DEAD' ELSE 'PENDING' END` |
-| Adding `NOT NULL idempotency_key` failed on existing rows | Thousands of rows had no value | Add the column nullable, backfill `'legacy-' \|\| id`, then `SET NOT NULL` |
-| All workers in Docker had PID 1 | Each container's app is its first process | The worker id is `hostname-pid`, so the container hostname keeps it unique |
-| Build failed after a signature change | A stale duplicate `JobController.java` under `src/test` | Deleted it |
-| Testcontainers could not reach Docker on Windows | Docker Desktop returned an empty 400 on the named pipe | Tests use a local `jobqueue_test` database instead; CI uses a Postgres service container |
-| CI failed with exit code 126 | `mvnw` was not executable in Git — Windows does not set the bit | `git update-index --chmod=+x mvnw` |
-| The chaos test was flaky in CI (198/200 succeeded) | At 30% abandonment some jobs reached `max_attempts` and went `DEAD`, which is correct behaviour rather than a failure | Lowered abandonment to 15% and assert `succeeded + dead = total` instead |
-| Job logic was hardcoded in `Worker`, so the queue could not be reused | `Worker` performed the sleep and the side effect itself | A `JobHandler` interface with a type-to-handler registry; heartbeats moved to a background timer so handlers control how long they take |
-| Tested stale code repeatedly | Windows locks the jar while it is running, Docker bakes a copy of it into the image, and Maven skips recompiling when the classes look current | Stop all `java` processes, check the jar's timestamp, rebuild the image, and run `mvnw clean` after a dependency change |
+| Jobs that crashed their worker retried forever | The Reaper always reset expired jobs to `PENDING` | Reaper now sends jobs with no attempts left to `DEAD` |
+| Chaos test flaky in CI (198/200 succeeded) | With 30% abandonment some jobs correctly ran out of attempts | Assert `succeeded + dead = total` instead of all succeeded |
+| CI failed with exit code 126 | `mvnw` was not executable (Windows doesn't set the bit) | `git update-index --chmod=+x mvnw` |
+| Testcontainers couldn't reach Docker on Windows | Docker Desktop named-pipe issue | Use a dedicated local test database; CI uses a service container |
 
 ## Known limitations
 
-- The Reaper is a single instance living inside the API. If the API is down,
-  nothing recovers expired leases.
-- `payload` has to be sent as a JSON string rather than a nested JSON object.
-- Both shipped handlers are fake: a sleep and a thrown exception, with a
-  `fake_payments` insert standing in for a real side effect.
-- `jobqueue.effects.skipped` is registered but never incremented. The counter and
-  the `SKIPPED` log line belonged to `Worker`; the effect moved into the handlers
-  and neither shipped handler checks what `applyEffectOnce` returned.
-- Timings run `created_at` to `updated_at`, which is queue wait plus execution,
-  not execution alone. There is no `started_at` column, so per-job execution time
-  is not recorded and a slow handler cannot be told apart from a long wait for a
-  free worker.
-- This is a reusable mechanism inside one application, not a published library.
-  There is no separate artifact, no stable public API surface, and nothing on
-  Maven Central.
-- `pom.xml` still targets Java 21 as its release level while the project runs on
-  25.
-- The API is write-only: `POST /jobs` and nothing else. There is no endpoint for
-  reading a job's state back.
-- Nothing is authenticated or rate limited, and the Compose database has no
-  volume, so its data goes when the container does.
-- Counters are per process, and workers run with
-  `spring.main.web-application-type=none`, so they expose no metrics endpoint at
-  all. Only the API's counters can be scraped, and those cover the API's own work
-  — the Reaper — not the workers'. A production setup would give workers a
-  management port and let Prometheus scrape every instance and sum them.
-- Prometheus and Grafana are not part of `docker-compose.yml`. The app exposes a
-  scrape endpoint and nothing collects or graphs it, so there is still no
-  dashboard.
-- The three gauges each run their own `COUNT(*)` on `jobs`, so one scrape is
-  three queries. Fine at this scale; a large table would need a cached or
-  approximate count instead.
-- The `worker` service uses `depends_on` on the API with
-  `condition: service_started`, which waits for the API container to start but
-  not for Flyway to finish migrating. The proper fix is an Actuator health check
-  on the API with `condition: service_healthy` — possible now that Actuator is
-  present, but not done yet.
-- Nothing tests the metrics. The endpoints and the increments were checked by
-  hand, not by an automated test.
+- **At-least-once, not exactly-once.** Side effects are protected by idempotency keys, but only if the handler uses them.
+- **Workers expose no metrics.** Workers run without a web server, so only the API's metrics can be scraped. A production setup would give each worker a management port.
+- **No authentication or rate limiting** on the API or admin endpoints.
+- **`POST /jobs` has no matching `GET`.** Job status is visible through the admin endpoints and the database, not per job.
+- **Polling, not push.** Workers poll every 10 ms; at large scale `LISTEN/NOTIFY` would reduce idle database load.
+- **Prometheus and Grafana are not included** in `docker-compose.yml`; the app exposes metrics but nothing collects them yet.
 
 ## Roadmap
 
-The phases not yet started:
+- [x] Concurrent claiming, leases, heartbeats, Reaper
+- [x] Retries with backoff and jitter, dead-letter state
+- [x] Idempotency keys
+- [x] Pluggable handlers and a real workload (document chunking)
+- [x] Prometheus metrics
+- [x] Chaos test and CI
+- [x] Admin API and Next.js dashboard
+- [x] Split into a reusable library with auto-configuration, published to GitHub Packages
+- [ ] Deploy a live demo
+- [ ] Kafka-backed variant, to compare a log-based queue with a table-based one
 
-- **Phase 6** — a real workload instead of sleeps
-- **Phase 8** — a dashboard with a chaos panel for killing workers from the browser
-- **Phase 11** — deploy it somewhere
-- **Phase 12** (optional) — a Kafka-backed variant, to compare a log against a table
+## Tech stack
+
+Java 25 · Spring Boot 4.1 · Spring JDBC (`JdbcTemplate`, no JPA: the SQL is the point) · PostgreSQL 16 · Flyway · Micrometer + Prometheus · JUnit 5 · Docker & Docker Compose · GitHub Actions · Next.js
+
+## Author
+
+**Sachintha Dilshan**: [GitHub](https://github.com/Sachintha-dilshan49) · [LinkedIn](https://www.linkedin.com/in/sachintha-dilshan-498a3a306)
